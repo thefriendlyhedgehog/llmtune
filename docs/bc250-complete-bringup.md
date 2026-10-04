@@ -9,6 +9,9 @@ the first time, not theoretical.
 Each tool's own README is the authoritative reference for flags/options; this guide is the path through
 both, start to finish, with the traps called out inline.
 
+Board already unlocked another way (unlocked UEFI, the MastaG `linux-cachyos-bc250` kernel, Limine)?
+Skip steps 2 to 10 and follow [bc250-pre-unlocked-bringup.md](bc250-pre-unlocked-bringup.md) instead.
+
 ## 0. Before you install anything
 
 Sync package mirrors first. A live CachyOS ISO's package database can be stale enough that a normal
