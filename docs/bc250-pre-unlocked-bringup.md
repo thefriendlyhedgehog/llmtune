@@ -4,7 +4,7 @@
 `linux-cachyos-bore` 7.0.9-1 kernel built by `aputune build`, GRUB, and the 8-core unlock from the TUI.
 This page is for a board that already has 8 cores and 40 CUs another way:
 
-* unlocked UEFI (MeiMei/Forbidden-Darkness: Core Unlock + SMU Unlock + SMU Patch), UMA 512M
+* unlocked UEFI (MeiMei/Forbidden-Darkness: Core Unlock + SMU Unlock + SMU Patch), UMA 512M in the menu
 * the MastaG `linux-cachyos-bc250` kernel from the `bc250-cachyos` pacman repo, 40 CU via
   `options amdgpu bc250_cc_write_mode=3`
 * Limine as the bootloader
@@ -24,6 +24,8 @@ cat /proc/cmdline
 ls /sys/module/amdgpu/parameters/ | grep bc250        # bc250_cc_write_mode, bc250_flush_by_runlist, ...
 cat /sys/module/amdgpu/parameters/bc250_cc_write_mode # 3
 cat /sys/module/amdgpu/parameters/gpu_recovery        # -1 = auto (default)
+cat /sys/class/drm/card*/device/mem_info_vram_total   # the real carve, see section 2
+grep MemTotal /proc/meminfo
 grep -h simd_count /sys/class/kfd/kfd/topology/nodes/*/properties   # 80 = 40 CU
 ```
 
@@ -35,8 +37,8 @@ for the arieltune kernel, ROCm, and the Vulkan inference path. For llmtune, whic
 
 | flag from the arieltune line | on the MastaG kernel serving Vulkan | why |
 |---|---|---|
-| `ttm.pages_limit=3588867 ttm.page_pool_size=3588867` | **use it** | raises the GPU-reachable system memory to ~13.7 GiB. llmtune's profiles size their contexts for ~14 GiB of UMA (`profiles.toml`), and a stock limit leaves less (12019 MiB measured on one board with `llama-cli --list-devices`) |
-| `amdgpu.gpu_recovery=1` | **use `=0` instead** | a GPU reset on this chip takes the host down ([akandr/bc250-rocm](https://github.com/akandr/bc250-rocm) "Known issues"); the MastaG README says boot with `amdgpu.gpu_recovery=0` so the machine stays reachable over SSH after a hang |
+| `ttm.pages_limit=3588867 ttm.page_pool_size=3588867` | **only if the carve really is 512 MB, and only if a model runs out** | the value assumes a 0.5 GiB carve plus ~16 GiB of system RAM (llmtune `src/mem.rs`). Check `mem_info_vram_total` first: one MeiMei board set to "UMA 512M" still reports an 8 GiB carve, with a 3.7 GiB default GTT limit (`ttm.pages_limit=979838`) and 12019 MiB visible to Vulkan (8192 + 3827). There, a 27B Q2_0 ternary reached 32K context on the stock limit, and a GTT limit above what Linux has left of RAM can only overcommit (inferred). Raise it only after a model fails to allocate, and size it to MemTotal |
+| `amdgpu.gpu_recovery=1` | **use `=0` instead** | a GPU reset on this chip takes the host down ([akandr/bc250-rocm](https://github.com/akandr/bc250-rocm) "Known issues"); the MastaG README says boot with `amdgpu.gpu_recovery=0` so the machine stays reachable over SSH after a hang. It does not help a silent hard lock-up (an undervolt too deep, for example), which needs a power cycle either way |
 | `amdgpu.bc250_flush_by_runlist=1` | optional, no effect on Vulkan | a KFD (ROCm) workaround; MastaG carries it opt-in (`docs/ROCM.md`). Vulkan does not use KFD queues |
 | `amdgpu.bc250_sdma_fw=navi12` | **drop** | an arieltune kernel patch; the MastaG kernel has no such parameter. Same fix by hand, if ever needed for ROCm, is the firmware copy in [GabriWar/bc250-rocm-working docs/29](https://github.com/GabriWar/bc250-rocm-working/blob/main/docs/29-the-sdma-firmware-is-the-bug.md) |
 | `amdgpu.ppfeaturemask`, `amdgpu.noretry=0`, `amdgpu.sched_hw_submission=2`, `iommu=pt amd_iommu=on` | leave as the kernel/board already has them | tuned for the arieltune kernel's SMU patches; nothing documents them as needed by the MastaG kernel. IOMMU off in BIOS is a supported setup |
@@ -48,7 +50,8 @@ there rather than replacing it:
 
 ```sh
 sudo nano /etc/default/limine
-#   KERNEL_CMDLINE[default]="<existing flags> ttm.pages_limit=3588867 ttm.page_pool_size=3588867 amdgpu.gpu_recovery=0"
+#   KERNEL_CMDLINE[default]="<existing flags> amdgpu.gpu_recovery=0"
+#   (add the ttm.* pair here only per the table above)
 sudo limine-mkinitcpio
 sudo systemctl reboot
 ```
@@ -105,8 +108,26 @@ gfx1013 rocBLAS and 13 llama.cpp patches, and measures roughly level with Vulkan
 decode 0.81-1.01x, [akandr/bc250-rocm](https://github.com/akandr/bc250-rocm) README, 2026-10-03), with a
 GPU reset that takes the host down. Stay on Vulkan for a serving box.
 
+## GPU governor method
+
+With MastaG's async-compute Mesa, `cyan-skillfish-governor-smu` on `method = "kernel"` sees
+`gpu_busy_percent` 0 under llama.cpp and leaves the GPU at its idle clock (measured: pp512 93 t/s
+instead of 379). Use `method = "process"` or `"busy-flag"` (`busy-flag` measured at 0.9 % of a core
+against 16 % for `process`, same speed). llmtune does not manage the governor.
+
+## One server at a time
+
+Left-over `llama-server` processes from hand-run scripts held VRAM on one board and answered requests
+meant for a new server, and the board later hard-locked. Before letting llmtune's unit serve, check
+`pgrep -a llama-server` shows nothing else, and stop hand-started servers rather than running both.
+
 ## Thermals before long serving runs
 
 Sustained llama.cpp load at 1500 MHz reached 93-94 C on akandr's board, after which the governor drops
 to 1000 MHz silently (akandr README, "GPU clock policy"). Watch `sensors` and the governor journal on
 the first long session, and finish cooling work before leaving the box serving unattended.
+
+Watch the GDDR6 too, not just the die. With the `bc250_memory` sensor (Hexxeh's driver, built into
+recent MastaG kernels as opt-in), one board's VRAM hotspot reached 100 C under a sustained llama-bench
+loop while the die sat near 76 C; a fan on the backplate brought it to 88 C. Read it one-off, not with
+a fast poller: an unbounded SMU wait in that path has hung boards (BC250-Telemetry issue #15).
